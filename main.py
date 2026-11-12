@@ -55,7 +55,7 @@ TAU_MIN = float(os.environ.get("MF_TAU_MIN", "0.5"))
 NEWCOMER_SHRINK = float(os.environ.get("MF_NEW_SHRINK", "0.3"))
 # Extra log10-size smoothing (sd) applied to each place's size distribution,
 # for model error and for newcomers holding the place.
-SIZE_SMOOTH_SD = float(os.environ.get("MF_SMOOTH", "0.03"))
+SIZE_SMOOTH_SD = float(os.environ.get("MF_SMOOTH", "0.04"))
 # Newcomer size distribution: Normal(sim place mean + NEW_SIZE_SHIFT,
 # sqrt(sim var + NEW_SIZE_SD^2)), mixed in with the newcomer mass.
 NEW_SIZE_SHIFT = float(os.environ.get("MF_NEW_SHIFT", "0.05"))
@@ -63,13 +63,32 @@ NEW_SIZE_SD = float(os.environ.get("MF_NEW_SD", "0.25"))
 # Place-level size model: how much of each place's size distribution comes
 # from a direct model of that place's cap level (drift + diffusion fitted
 # from the marks' place-cap series) rather than the Monte Carlo histogram.
-PLACE_BLEND = float(os.environ.get("MF_PLACE_BLEND", "0.85"))
+# v4: 0.80, between v2's 0.70 and v3's 0.85.
+PLACE_BLEND = float(os.environ.get("MF_PLACE_BLEND", "0.80"))
 PLACE_DRIFT_DAMP_H = float(os.environ.get("MF_PLACE_DAMP", "6.0"))
-# Cap on the fitted place-cap drift (dex/h). The birth phase really does
-# rise ~+1.5-2 dex/h at places 2-5, so a 0.5 cap throws most of it away.
-PLACE_DRIFT_CAP = float(os.environ.get("MF_PLACE_DRIFT_CAP", "1.5"))
-PLACE_SHIFT_LO = float(os.environ.get("MF_PLACE_SHIFT_LO", "-1.0"))
-PLACE_SHIFT_HI = float(os.environ.get("MF_PLACE_SHIFT_HI", "1.5"))
+# Cap on the fitted place-cap drift (dex/h). v4 returns to v2's 0.5: the
+# oracle (eval/oracle4.py, 15 held-out observations) shows the 0.5 cap gives
+# the best centre (bias +0.015, rmse 0.060) while the 1.5 cap overshoots
+# (bias -0.168, rmse 0.216). The birth phase really does rise +1.5-2 dex/h
+# at places 2-5, but that is a one-off fill-in (the top-5 caps converge from
+# a 1.2 dex spread to 0.28 dex), not a sustainable drift: extrapolating it
+# put v3's place 2-5 centres ~0.5 dex too high. The saturating cap below
+# (PLACE_SAT_*) handles genuine deceleration instead.
+PLACE_DRIFT_CAP = float(os.environ.get("MF_PLACE_DRIFT_CAP", "0.5"))
+PLACE_SHIFT_LO = float(os.environ.get("MF_PLACE_SHIFT_LO", "-0.8"))
+PLACE_SHIFT_HI = float(os.environ.get("MF_PLACE_SHIFT_HI", "1.0"))
+# Saturating-drift cap: the shift may not exceed what the recent regime
+# supports — the slope on the last PLACE_RECENT_N marks, shrunk halfway
+# toward the pooled recent slope across places, saturated with time
+# constant PLACE_SAT_TAU_H, plus PLACE_SAT_MARGIN. In the birth-phase dev
+# run this never binds (recent slopes are still high); it binds in the
+# final when the market has matured and the long-window slope is stale.
+# The recent slope is deliberately NOT the primary drift: on its own it
+# is too noisy (oracle rmse 0.166 vs 0.060 for the capped long slope),
+# so it only caps, never drives.
+PLACE_RECENT_N = int(os.environ.get("MF_PLACE_RECENT_N", "3"))
+PLACE_SAT_TAU_H = float(os.environ.get("MF_PLACE_SAT_TAU", "1.5"))
+PLACE_SAT_MARGIN = float(os.environ.get("MF_PLACE_SAT_MARGIN", "0.15"))
 # Width of the place-level size forecast at horizon h:
 #   sd(h) = sqrt(resid^2 + DIFF_SD^2 * h + min((se * DAMP(h))^2, SE_CAP^2))
 # resid is the place series' residual sd around its own fitted trend
@@ -79,8 +98,12 @@ PLACE_SHIFT_HI = float(os.environ.get("MF_PLACE_SHIFT_HI", "1.5"))
 # centre's own uncertainty, damped the same way as the drift itself.
 PLACE_DIFF_SD = float(os.environ.get("MF_PLACE_DIFF_SD", "0.06"))
 PLACE_SE_CAP = float(os.environ.get("MF_PLACE_SE_CAP", "0.45"))
-PLACE_SD_FLOOR = float(os.environ.get("MF_PLACE_SD_FLOOR", "0.08"))
-PLACE_SD_CAP = float(os.environ.get("MF_PLACE_SD_CAP", "0.60"))
+# v4: floor 0.15, cap 0.65 — back toward v2's effective widths (0.21-0.43)
+# from v3's 0.08 floor, which was overconfident once the centre was off.
+# The width is insurance against centre error at the 30-70 min reads,
+# where the oracle cannot measure it; when in doubt, wider.
+PLACE_SD_FLOOR = float(os.environ.get("MF_PLACE_SD_FLOOR", "0.15"))
+PLACE_SD_CAP = float(os.environ.get("MF_PLACE_SD_CAP", "0.65"))
 # Name hopeless coins at p 0 (they leave the unnamed share to the rest):
 # a coin is hopeless at a place when its simulated probability there is
 # negligible and its last cap is small. 0 disables the tactic.
@@ -569,6 +592,8 @@ def main():
     place_drift_se = []
     place_resid = []
     place_vol = []
+    recent_slopes = []
+    place_recent = []
     pooled_incr = []
     pooled_resid = []
     for k in range(places):
@@ -579,6 +604,7 @@ def main():
             place_drift_se.append(1.0)
             place_resid.append(0.15)
             place_vol.append(0.2)
+            recent_slopes.append(0.0)
             continue
         place_last.append(s[-1][1])
         pts = s[-12:]
@@ -603,6 +629,19 @@ def main():
         place_drift_se.append(min(se, 2.0))
         place_resid.append(resid)
         pooled_resid.append(resid)
+        # Recent-regime slope (last PLACE_RECENT_N marks) for the saturating
+        # cap: it sees the deceleration the long window averages away, but
+        # on its own it is too noisy to drive the centre (see oracle4.py).
+        pts3 = s[-PLACE_RECENT_N:]
+        if len(pts3) >= 2:
+            mt3 = sum(p[0] for p in pts3) / len(pts3)
+            my3 = sum(p[1] for p in pts3) / len(pts3)
+            sxx3 = sum((p[0] - mt3) ** 2 for p in pts3)
+            slope3 = (sum((p[0] - mt3) * (p[1] - my3) for p in pts3) / sxx3
+                      if sxx3 > 1e-9 else 0.0)
+        else:
+            slope3 = 0.0
+        recent_slopes.append(min(max(slope3, -1.5), 1.5))
         place_vol.append(None)
         for (t1, y1), (t2, y2) in zip(s, s[1:]):
             if t2 > t1:
@@ -644,6 +683,40 @@ def main():
         place_resid[k] = math.sqrt((n_pts * r * r + 4.0 * resid_pool ** 2)
                                    / (n_pts + 4.0))
         place_resid[k] = min(max(place_resid[k], 0.06), 0.25)
+    # Recent slopes, shrunk halfway toward the pooled recent slope across
+    # places: a single place's last-3 slope is one or two replacement
+    # jumps away from noise, so the pool carries half the weight.
+    if recent_slopes:
+        pooled_recent = sum(recent_slopes) / len(recent_slopes)
+    else:
+        pooled_recent = 0.0
+    place_recent = [0.5 * r + 0.5 * pooled_recent for r in recent_slopes]
+
+    # v4 centres, computed for all places first so the structural guards
+    # can see across places. Base rule = v2's (long slope capped 0.5,
+    # damped 6h, clamped): the oracle shows it is the best centre
+    # in-sample (bias +0.015, rmse 0.060). Two guards on top:
+    # (a) saturation cap: the shift may not exceed the recent regime's
+    # saturated shift plus a margin — in the dev run this never binds,
+    # it binds in the final when the market has matured and the long
+    # slope is stale; (b) monotonicity: cap_k <= cap_{k-1} always, so
+    # the centres must not increase down the places (v3's did: its
+    # place-2 centre 4.20 sat above place 1's 4.10 — impossible).
+    centers = [[0.0] * n_reads for _ in range(places)]
+    for k in range(places):
+        for j in range(n_reads):
+            h = horizons[j]
+            shift = (place_drift[k] * PLACE_DRIFT_DAMP_H
+                     * (1.0 - math.exp(-h / PLACE_DRIFT_DAMP_H)))
+            shift = min(max(shift, PLACE_SHIFT_LO), PLACE_SHIFT_HI)
+            shift_sat = (place_recent[k] * PLACE_SAT_TAU_H
+                         * (1.0 - math.exp(-h / PLACE_SAT_TAU_H)))
+            shift = min(shift, shift_sat + PLACE_SAT_MARGIN)
+            centers[k][j] = place_last[k] + shift
+    for j in range(n_reads):
+        for k in range(1, places):
+            if centers[k][j] > centers[k - 1][j]:
+                centers[k][j] = centers[k - 1][j]
 
     size_prob = [dict() for _ in range(places)]
     for k in range(places):
@@ -657,10 +730,7 @@ def main():
             pl = {}
             for j in range(n_reads):
                 h = horizons[j]
-                shift = (place_drift[k] * PLACE_DRIFT_DAMP_H
-                         * (1.0 - math.exp(-h / PLACE_DRIFT_DAMP_H)))
-                shift = min(max(shift, PLACE_SHIFT_LO), PLACE_SHIFT_HI)
-                mean = place_last[k] + shift
+                mean = centers[k][j]
                 damp_h = PLACE_DRIFT_DAMP_H * (1.0 - math.exp(-h / PLACE_DRIFT_DAMP_H))
                 se_term = min((place_drift_se[k] * damp_h) ** 2, PLACE_SE_CAP ** 2)
                 sd = math.sqrt(place_resid[k] ** 2 + PLACE_DIFF_SD ** 2 * h + se_term)
