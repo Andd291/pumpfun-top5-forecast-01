@@ -40,16 +40,31 @@ MAX_CANDIDATES = 500
 MAX_ROWS_PER_PLACE = 60
 # Fallback newcomer mass at a read h hours after the cut:
 # Q_INF * (1 - exp(-h / TAU)). At run time the history's own mark pairs
-# refit (Q_INF, TAU); these are used only when too few pairs exist.
+# refit (Q_INF, TAU); these are used only when too few pairs exist. The fit
+# is then shrunk halfway toward a prior (Q_PRIOR, TAU_PRIOR) and capped at
+# Q_MAX: the raw fit on a young market lands on the grid corner (Q=0.95,
+# fast saturation) and would leave almost nothing to the coins the history
+# actually names; the prior keeps it honest at the long horizons the final
+# is scored on.
 Q_INF = float(os.environ.get("MF_Q_INF", "0.70"))
 TAU_HOURS = float(os.environ.get("MF_TAU", "1.0"))
+Q_PRIOR = float(os.environ.get("MF_Q_PRIOR", "0.55"))
+TAU_PRIOR = float(os.environ.get("MF_TAU_PRIOR", "1.5"))
+Q_MAX = float(os.environ.get("MF_Q_MAX", "0.70"))
+TAU_MIN = float(os.environ.get("MF_TAU_MIN", "0.5"))
+NEWCOMER_SHRINK = float(os.environ.get("MF_NEW_SHRINK", "0.3"))
 # Extra log10-size smoothing (sd) applied to each place's size distribution,
 # for model error and for newcomers holding the place.
-SIZE_SMOOTH_SD = float(os.environ.get("MF_SMOOTH", "0.15"))
+SIZE_SMOOTH_SD = float(os.environ.get("MF_SMOOTH", "0.06"))
 # Newcomer size distribution: Normal(sim place mean + NEW_SIZE_SHIFT,
 # sqrt(sim var + NEW_SIZE_SD^2)), mixed in with the newcomer mass.
-NEW_SIZE_SHIFT = float(os.environ.get("MF_NEW_SHIFT", "0.10"))
-NEW_SIZE_SD = float(os.environ.get("MF_NEW_SD", "0.45"))
+NEW_SIZE_SHIFT = float(os.environ.get("MF_NEW_SHIFT", "0.05"))
+NEW_SIZE_SD = float(os.environ.get("MF_NEW_SD", "0.25"))
+# Place-level size model: how much of each place's size distribution comes
+# from a direct model of that place's cap level (drift + diffusion fitted
+# from the marks' place-cap series) rather than the Monte Carlo histogram.
+PLACE_BLEND = float(os.environ.get("MF_PLACE_BLEND", "0.7"))
+PLACE_DRIFT_DAMP_H = float(os.environ.get("MF_PLACE_DAMP", "6.0"))
 # Name hopeless coins at p 0 (they leave the unnamed share to the rest):
 # a coin is hopeless at a place when its simulated probability there is
 # negligible and its last cap is small. 0 disables the tactic.
@@ -61,8 +76,13 @@ HAZARD = {"pool": 0.02, "curve": 0.20}
 GRAD_HAZARD = 0.08
 GRAD_HAZARD_MIGRATING = 1.0
 # Mean/sd of the one-off log-cap shock when a curve coin graduates.
-GRAD_SHOCK_MEAN = -0.15
+# Measured on the dev history's six curve->pool transitions: mean -0.31,
+# sd 0.57 (graduating usually reprices down as the pool opens).
+GRAD_SHOCK_MEAN = -0.30
 GRAD_SHOCK_SD = 0.45
+# Per-coin slopes are shrunk toward the class drift by exp(-h_max / TAU):
+# a coin's recent momentum is real at 1h out and mostly noise at 13h out.
+SLOPE_DAMP_TAU_H = float(os.environ.get("MF_SLOPE_DAMP", "8.0"))
 MICRO = 1_000_000
 
 
@@ -75,7 +95,7 @@ def bin_of(x, edges):
     if x < edges[0]:
         return 0
     if x >= edges[-1]:
-        return len(edges) + 1
+        return len(edges)
     lo, hi = 0, len(edges) - 1
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -141,7 +161,7 @@ def _bin_center(b, edges):
     """Representative log10 value of bin b (0..81)."""
     if b <= 0:
         return edges[0] - 0.025
-    if b >= len(edges) + 1:
+    if b >= len(edges):
         return edges[-1] + 0.025
     return (edges[b - 1] + edges[b]) / 2.0
 
@@ -333,6 +353,11 @@ def main():
             w = k / (k + 3.0)
             drift = w * slope + (1.0 - w) * drift_class
         drift = min(max(drift, -1.2), 1.0)
+        # Horizon-adaptive shrinkage: the further the reads, the less a
+        # coin's own recent slope is worth relative to its class drift.
+        h_max = max(horizons) if horizons else 0.0
+        damp = math.exp(-h_max / SLOPE_DAMP_TAU_H)
+        drift = drift_class + (drift - drift_class) * damp
         sigma_class = fits[venue][3]
         if resid_sd is None or ts is None:
             sigma = sigma_class
@@ -370,6 +395,11 @@ def main():
     # mark j's top 5 that no row up to i had named is a direct measurement of
     # the probability a place is held by a coin the cut's history cannot name
     # (born later, or never ranked in it). Fit q(h) = Q*(1-exp(-h/TAU)).
+    # Two guards against the birth phase lying to us: cuts come only from
+    # the last half of the marks and only from marks that actually ranked
+    # coins (an empty first mark would report every later coin as new), and
+    # the fitted curve is shrunk halfway toward a slow prior and capped, so
+    # a short noisy history cannot reserve ~everything for newcomers.
     q_inf, tau_h = Q_INF, TAU_HOURS
     pts = []  # (h_hours, frac_newcomers_in_top5, weight)
     n_marks = len(marks)
@@ -383,7 +413,10 @@ def main():
     # Recency weight: the latest cut counts most; half-life ~ a quarter of
     # the history in marks (at least 3 marks).
     hl = max(2.0, n_marks / 6.0)
-    for i in range(n_marks):
+    first_cut = max(0, n_marks - max(6, n_marks // 2))
+    for i in range(first_cut, n_marks):
+        if len(marks[i].get("rows") or []) < 30:
+            continue
         w_i = 0.5 ** ((n_marks - 1 - i) / hl)
         for j in range(i + 1, n_marks):
             h = mark_t[j] - mark_t[i]
@@ -397,17 +430,28 @@ def main():
             pts.append((h, frac, w_i))
     if len(pts) >= 3:
         best = None
-        for q_try in [0.30 + 0.05 * k for k in range(14)]:
-            for tau_try in [0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]:
+        for q_try in [0.20 + 0.05 * k for k in range(11)]:
+            for tau_try in [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]:
                 err = sum(w * (q_try * (1.0 - math.exp(-h / tau_try)) - f) ** 2
                           for (h, f, w) in pts)
                 if best is None or err < best[0]:
                     best = (err, q_try, tau_try)
         if best is not None:
             _, q_inf, tau_h = best
+
+    def q_at(h):
+        """Newcomer share h hours after the cut: fitted curve shrunk
+        halfway toward the slow prior, capped."""
+        if h <= 0:
+            return 0.0
+        qf = q_inf * (1.0 - math.exp(-h / tau_h))
+        qp = Q_PRIOR * (1.0 - math.exp(-h / TAU_PRIOR))
+        q = (1.0 - NEWCOMER_SHRINK) * qf + NEWCOMER_SHRINK * qp
+        return min(q, Q_MAX)
+
     if os.environ.get("MF_DEBUG"):
         print(f"[debug] newcomer fit: pts={len(pts)} q_inf={q_inf:.2f} "
-              f"tau={tau_h}h keep={[round(k, 2) for k in [1 - q_inf * (1 - math.exp(-h / tau_h)) if h > 0 else 1.0 for h in horizons]]}",
+              f"tau={tau_h}h keep={[round(1 - q_at(h), 2) for h in horizons]}",
               file=sys.stderr)
 
     big = [c for c in cand if c["y"] >= 2.5]
@@ -479,8 +523,7 @@ def main():
     keep = []
     qbar = 0.0
     for j in range(n_reads):
-        h = horizons[j]
-        q = q_inf * (1.0 - math.exp(-h / tau_h)) if h > 0 else 0.0
+        q = q_at(horizons[j])
         keep.append(1.0 - q)
         qbar += q / n_reads
     prob = [dict() for _ in range(places)]
@@ -490,12 +533,108 @@ def main():
             for mint, cnt in place_counts[j][k].items():
                 acc[mint] = acc.get(mint, 0.0) + (cnt / N_PATHS) * keep[j] / n_reads
         prob[k] = acc
+    # ----------------- place-level size model: each place's cap level
+    # The Monte Carlo's k-th-largest-cap histogram is wide: every coin's own
+    # volatility feeds it, and the newcomer mixture widens it further. The
+    # place cap itself is a much tamer series — fit its drift and volatility
+    # directly from the marks and forecast it per read. Drift is damped
+    # (it cannot compound forever) and capped; volatility is shrunk toward
+    # the pooled value across places.
+    place_series = [[] for _ in range(places)]  # (t_hours, log10 cap SOL)
+    for m in marks:
+        t = (parse_time(m["at"]) - t0).total_seconds() / 3600.0
+        rows = sorted(m["rows"], key=lambda r: r["rank"])
+        for k in range(min(places, len(rows))):
+            cap = int(rows[k]["market_cap_lamports"])
+            if cap > 0:
+                place_series[k].append((t, math.log10(cap) - 9.0))
+    place_last = []
+    place_drift = []
+    place_drift_se = []
+    place_vol = []
+    pooled_incr = []
+    for k in range(places):
+        s = place_series[k]
+        if not s:
+            place_last.append(3.0)
+            place_drift.append(0.0)
+            place_drift_se.append(1.0)
+            place_vol.append(0.2)
+            continue
+        place_last.append(s[-1][1])
+        pts = s[-12:]
+        if len(pts) >= 2:
+            mt = sum(p[0] for p in pts) / len(pts)
+            my = sum(p[1] for p in pts) / len(pts)
+            sxx = sum((p[0] - mt) ** 2 for p in pts)
+            slope = (sum((p[0] - mt) * (p[1] - my) for p in pts) / sxx
+                     if sxx > 1e-9 else 0.0)
+            if len(pts) >= 3 and sxx > 1e-9:
+                ss = sum((p[1] - (my + slope * (p[0] - mt))) ** 2 for p in pts)
+                resid = math.sqrt(ss / (len(pts) - 2))
+                se = max(resid, 0.05) / math.sqrt(sxx)
+            else:
+                se = 1.0
+        else:
+            slope = 0.0
+            se = 1.0
+        place_drift.append(min(max(slope, -0.5), 0.5))
+        place_drift_se.append(min(se, 2.0))
+        place_vol.append(None)
+        for (t1, y1), (t2, y2) in zip(s, s[1:]):
+            if t2 > t1:
+                pooled_incr.append((y2 - y1) / math.sqrt(t2 - t1))
+    if pooled_incr:
+        mu = sum(pooled_incr) / len(pooled_incr)
+        vol_pool = math.sqrt(sum((d - mu) ** 2 for d in pooled_incr)
+                             / len(pooled_incr))
+    else:
+        vol_pool = 0.2
+    vol_pool = min(max(vol_pool, 0.08), 0.40)
+    for k in range(places):
+        if place_vol[k] is not None:
+            continue
+        s = place_series[k]
+        diffs = [(y2 - y1) / math.sqrt(t2 - t1)
+                 for (t1, y1), (t2, y2) in zip(s, s[1:])
+                 if t2 > t1]
+        if len(diffs) >= 3:
+            mu = sum(diffs) / len(diffs)
+            v = math.sqrt(sum((d - mu) ** 2 for d in diffs) / len(diffs))
+            v = math.sqrt((len(diffs) * v * v + 4.0 * vol_pool ** 2)
+                          / (len(diffs) + 4.0))
+        else:
+            v = vol_pool
+        place_vol[k] = min(max(v, 0.08), 0.40)
+
     size_prob = [dict() for _ in range(places)]
     for k in range(places):
         acc = {}
         for j in range(n_reads):
             for b, cnt in size_hist[j][k].items():
                 acc[b] = acc.get(b, 0.0) + (cnt / N_PATHS) / n_reads
+        # Blend with the place-level forecast: a Normal per read, averaged
+        # over reads (the mixture over reads is what widens it honestly).
+        if PLACE_BLEND > 0:
+            pl = {}
+            for j in range(n_reads):
+                h = horizons[j]
+                shift = (place_drift[k] * PLACE_DRIFT_DAMP_H
+                         * (1.0 - math.exp(-h / PLACE_DRIFT_DAMP_H)))
+                shift = min(max(shift, -0.8), 1.0)
+                mean = place_last[k] + shift
+                sd = math.sqrt(place_vol[k] ** 2 * h
+                               + (place_drift_se[k] * h) ** 2 + 0.02)
+                sd = min(max(sd, 0.12), 0.9)
+                nb = normal_bins(mean, sd, edges)
+                for b, p in nb.items():
+                    pl[b] = pl.get(b, 0.0) + p / n_reads
+            merged = {}
+            for b, p in acc.items():
+                merged[b] = (1.0 - PLACE_BLEND) * p
+            for b, p in pl.items():
+                merged[b] = merged.get(b, 0.0) + PLACE_BLEND * p
+            acc = merged
         if qbar > 0.01:
             # Newcomers holding the place run a little larger and much wider
             # than the simulated place cap: mix in a widened component.
