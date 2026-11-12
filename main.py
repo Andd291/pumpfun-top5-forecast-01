@@ -55,7 +55,7 @@ TAU_MIN = float(os.environ.get("MF_TAU_MIN", "0.5"))
 NEWCOMER_SHRINK = float(os.environ.get("MF_NEW_SHRINK", "0.3"))
 # Extra log10-size smoothing (sd) applied to each place's size distribution,
 # for model error and for newcomers holding the place.
-SIZE_SMOOTH_SD = float(os.environ.get("MF_SMOOTH", "0.06"))
+SIZE_SMOOTH_SD = float(os.environ.get("MF_SMOOTH", "0.03"))
 # Newcomer size distribution: Normal(sim place mean + NEW_SIZE_SHIFT,
 # sqrt(sim var + NEW_SIZE_SD^2)), mixed in with the newcomer mass.
 NEW_SIZE_SHIFT = float(os.environ.get("MF_NEW_SHIFT", "0.05"))
@@ -63,8 +63,24 @@ NEW_SIZE_SD = float(os.environ.get("MF_NEW_SD", "0.25"))
 # Place-level size model: how much of each place's size distribution comes
 # from a direct model of that place's cap level (drift + diffusion fitted
 # from the marks' place-cap series) rather than the Monte Carlo histogram.
-PLACE_BLEND = float(os.environ.get("MF_PLACE_BLEND", "0.7"))
+PLACE_BLEND = float(os.environ.get("MF_PLACE_BLEND", "0.85"))
 PLACE_DRIFT_DAMP_H = float(os.environ.get("MF_PLACE_DAMP", "6.0"))
+# Cap on the fitted place-cap drift (dex/h). The birth phase really does
+# rise ~+1.5-2 dex/h at places 2-5, so a 0.5 cap throws most of it away.
+PLACE_DRIFT_CAP = float(os.environ.get("MF_PLACE_DRIFT_CAP", "1.5"))
+PLACE_SHIFT_LO = float(os.environ.get("MF_PLACE_SHIFT_LO", "-1.0"))
+PLACE_SHIFT_HI = float(os.environ.get("MF_PLACE_SHIFT_HI", "1.5"))
+# Width of the place-level size forecast at horizon h:
+#   sd(h) = sqrt(resid^2 + DIFF_SD^2 * h + min((se * DAMP(h))^2, SE_CAP^2))
+# resid is the place series' residual sd around its own fitted trend
+# (the honest short-horizon noise: replacement jumps, not the raw
+# increment dispersion, which double-counts the trend the center already
+# extrapolates); DIFF_SD is slow diffusion; the slope-SE term is the
+# centre's own uncertainty, damped the same way as the drift itself.
+PLACE_DIFF_SD = float(os.environ.get("MF_PLACE_DIFF_SD", "0.06"))
+PLACE_SE_CAP = float(os.environ.get("MF_PLACE_SE_CAP", "0.45"))
+PLACE_SD_FLOOR = float(os.environ.get("MF_PLACE_SD_FLOOR", "0.08"))
+PLACE_SD_CAP = float(os.environ.get("MF_PLACE_SD_CAP", "0.60"))
 # Name hopeless coins at p 0 (they leave the unnamed share to the rest):
 # a coin is hopeless at a place when its simulated probability there is
 # negligible and its last cap is small. 0 disables the tactic.
@@ -551,14 +567,17 @@ def main():
     place_last = []
     place_drift = []
     place_drift_se = []
+    place_resid = []
     place_vol = []
     pooled_incr = []
+    pooled_resid = []
     for k in range(places):
         s = place_series[k]
         if not s:
             place_last.append(3.0)
             place_drift.append(0.0)
             place_drift_se.append(1.0)
+            place_resid.append(0.15)
             place_vol.append(0.2)
             continue
         place_last.append(s[-1][1])
@@ -574,12 +593,16 @@ def main():
                 resid = math.sqrt(ss / (len(pts) - 2))
                 se = max(resid, 0.05) / math.sqrt(sxx)
             else:
+                resid = 0.15
                 se = 1.0
         else:
             slope = 0.0
+            resid = 0.15
             se = 1.0
-        place_drift.append(min(max(slope, -0.5), 0.5))
+        place_drift.append(min(max(slope, -PLACE_DRIFT_CAP), PLACE_DRIFT_CAP))
         place_drift_se.append(min(se, 2.0))
+        place_resid.append(resid)
+        pooled_resid.append(resid)
         place_vol.append(None)
         for (t1, y1), (t2, y2) in zip(s, s[1:]):
             if t2 > t1:
@@ -606,6 +629,21 @@ def main():
         else:
             v = vol_pool
         place_vol[k] = min(max(v, 0.08), 0.40)
+    # Residual sd around each place's fitted trend, shrunk toward the pooled
+    # value: this is the honest short-horizon noise of the place cap (the
+    # raw increment dispersion double-counts the trend the centre already
+    # extrapolates, which is why v2's widths were 3x too wide).
+    if pooled_resid:
+        resid_pool = math.sqrt(sum(r * r for r in pooled_resid) / len(pooled_resid))
+    else:
+        resid_pool = 0.15
+    resid_pool = min(max(resid_pool, 0.06), 0.25)
+    for k in range(places):
+        n_pts = min(len(place_series[k][-12:]), 12)
+        r = place_resid[k]
+        place_resid[k] = math.sqrt((n_pts * r * r + 4.0 * resid_pool ** 2)
+                                   / (n_pts + 4.0))
+        place_resid[k] = min(max(place_resid[k], 0.06), 0.25)
 
     size_prob = [dict() for _ in range(places)]
     for k in range(places):
@@ -621,11 +659,12 @@ def main():
                 h = horizons[j]
                 shift = (place_drift[k] * PLACE_DRIFT_DAMP_H
                          * (1.0 - math.exp(-h / PLACE_DRIFT_DAMP_H)))
-                shift = min(max(shift, -0.8), 1.0)
+                shift = min(max(shift, PLACE_SHIFT_LO), PLACE_SHIFT_HI)
                 mean = place_last[k] + shift
-                sd = math.sqrt(place_vol[k] ** 2 * h
-                               + (place_drift_se[k] * h) ** 2 + 0.02)
-                sd = min(max(sd, 0.12), 0.9)
+                damp_h = PLACE_DRIFT_DAMP_H * (1.0 - math.exp(-h / PLACE_DRIFT_DAMP_H))
+                se_term = min((place_drift_se[k] * damp_h) ** 2, PLACE_SE_CAP ** 2)
+                sd = math.sqrt(place_resid[k] ** 2 + PLACE_DIFF_SD ** 2 * h + se_term)
+                sd = min(max(sd, PLACE_SD_FLOOR), PLACE_SD_CAP)
                 nb = normal_bins(mean, sd, edges)
                 for b, p in nb.items():
                     pl[b] = pl.get(b, 0.0) + p / n_reads
